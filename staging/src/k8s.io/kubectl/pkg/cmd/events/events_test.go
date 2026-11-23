@@ -217,3 +217,46 @@ foo         18m (x3 over 28m)   Warning   ScalingReplicaSet   Deployment/bar   S
 		t.Errorf("expected\n%v\ngot\n%v", e, a)
 	}
 }
+
+func TestEventSince(t *testing.T) {
+	codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
+	streams, _, buf, _ := genericiooptions.NewTestIOStreams()
+	clientset, err := kubernetes.NewForConfig(cmdtesting.DefaultClientConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientset.CoreV1().RESTClient().(*restclient.RESTClient).Client = fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, getFakeEvents())}, nil
+	})
+
+	printer := NewEventPrinter(false, true)
+
+	options := &EventsOptions{
+		AllNamespaces: true,
+		client:        clientset,
+		Since:         16 * time.Minute,
+		PrintObj: func(object runtime.Object, writer io.Writer) error {
+			return printer.PrintObj(object, writer)
+		},
+		IOStreams: streams,
+	}
+
+	if err := options.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `NAMESPACE   LAST SEEN           TYPE     REASON              OBJECT           MESSAGE
+otherfoo    15m (x3 over 25m)   Normal   ScalingReplicaSet   Deployment/bar   Scaled up replica set bar-002 from 0 to 1
+`
+	if e, a := expected, buf.String(); e != a {
+		t.Errorf("expected\n%v\ngot\n%v", e, a)
+	}
+}
+
+func TestEventSinceValidation(t *testing.T) {
+	options := &EventsOptions{Since: -time.Minute}
+	if err := options.Validate(); err == nil {
+		t.Fatal("expected an error for a negative --since")
+	}
+}

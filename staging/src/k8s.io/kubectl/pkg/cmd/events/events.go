@@ -69,7 +69,10 @@ var (
 	kubectl events -oyaml
 
 	# List recent only events of type 'Warning' or 'Normal'
-	kubectl events --types=Warning,Normal`))
+	kubectl events --types=Warning,Normal
+
+	# List events from the last 10 minutes
+	kubectl events --since=10m`))
 )
 
 // EventsFlags directly reflect the information that CLI is gathering via flags.  They will be converted to Options, which
@@ -84,6 +87,7 @@ type EventsFlags struct {
 	NoHeaders     bool
 	ForObject     string
 	FilterTypes   []string
+	Since         time.Duration
 	ChunkSize     int64
 	genericiooptions.IOStreams
 }
@@ -105,6 +109,7 @@ type EventsOptions struct {
 	AllNamespaces bool
 	Watch         bool
 	FilterTypes   []string
+	Since         time.Duration
 
 	forGVK  schema.GroupVersionKind
 	forName string
@@ -121,7 +126,7 @@ func NewCmdEvents(restClientGetter genericclioptions.RESTClientGetter, streams g
 	flags := NewEventsFlags(restClientGetter, streams)
 
 	cmd := &cobra.Command{
-		Use:                   fmt.Sprintf("events [(-o|--output=)%s] [--for TYPE/NAME] [--watch] [--types=Normal,Warning]", strings.Join(flags.PrintFlags.AllowedFormats(), "|")),
+		Use:                   fmt.Sprintf("events [(-o|--output=)%s] [--for TYPE/NAME] [--since=DURATION] [--watch] [--types=Normal,Warning]", strings.Join(flags.PrintFlags.AllowedFormats(), "|")),
 		DisableFlagsInUseLine: true,
 		Short:                 i18n.T("List events"),
 		Long:                  eventsLong,
@@ -144,6 +149,7 @@ func (flags *EventsFlags) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVarP(&flags.AllNamespaces, "all-namespaces", "A", flags.AllNamespaces, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
 	cmd.Flags().StringVar(&flags.ForObject, "for", flags.ForObject, "Filter events to only those pertaining to the specified resource.")
 	cmd.Flags().StringSliceVar(&flags.FilterTypes, "types", flags.FilterTypes, "Output only events of given types.")
+	cmd.Flags().DurationVar(&flags.Since, "since", flags.Since, "Only return events newer than a relative duration like 5s, 2m, or 3h.")
 	cmd.Flags().BoolVar(&flags.NoHeaders, "no-headers", flags.NoHeaders, "When using the default output format, don't print headers.")
 	cmdutil.AddChunkSizeFlag(cmd, &flags.ChunkSize)
 }
@@ -154,6 +160,7 @@ func (flags *EventsFlags) ToOptions() (*EventsOptions, error) {
 		AllNamespaces: flags.AllNamespaces,
 		Watch:         flags.Watch,
 		FilterTypes:   flags.FilterTypes,
+		Since:         flags.Since,
 		IOStreams:     flags.IOStreams,
 	}
 	var err error
@@ -209,6 +216,10 @@ func (flags *EventsFlags) ToOptions() (*EventsOptions, error) {
 }
 
 func (o *EventsOptions) Validate() error {
+	if o.Since < 0 {
+		return fmt.Errorf("--since must be greater than or equal to 0")
+	}
+
 	for _, val := range o.FilterTypes {
 		if !strings.EqualFold(val, "Normal") && !strings.EqualFold(val, "Warning") {
 			return fmt.Errorf("valid --types are Normal or Warning")
@@ -225,6 +236,10 @@ func (o *EventsOptions) Run() error {
 	if o.AllNamespaces {
 		namespace = ""
 	}
+	cutoff := time.Time{}
+	if o.Since > 0 {
+		cutoff = time.Now().Add(-o.Since)
+	}
 	listOptions := metav1.ListOptions{Limit: cmdutil.DefaultChunkSize}
 	if o.forName != "" {
 		listOptions.FieldSelector = fields.AndSelectors(
@@ -233,7 +248,7 @@ func (o *EventsOptions) Run() error {
 			fields.OneTermEqualSelector("involvedObject.name", o.forName)).String()
 	}
 	if o.Watch {
-		return o.runWatch(ctx, namespace, listOptions)
+		return o.runWatch(ctx, namespace, listOptions, cutoff)
 	}
 
 	e := o.client.CoreV1().Events(namespace)
@@ -259,7 +274,7 @@ func (o *EventsOptions) Run() error {
 
 	var filteredEvents []corev1.Event
 	for _, e := range el.Items {
-		if !o.filteredEventType(e.Type) {
+		if !o.filteredEvent(e, cutoff) {
 			continue
 		}
 		if e.GetObjectKind().GroupVersionKind().Empty() {
@@ -291,7 +306,7 @@ func (o *EventsOptions) Run() error {
 	return nil
 }
 
-func (o *EventsOptions) runWatch(ctx context.Context, namespace string, listOptions metav1.ListOptions) error {
+func (o *EventsOptions) runWatch(ctx context.Context, namespace string, listOptions metav1.ListOptions, cutoff time.Time) error {
 	eventWatch, err := o.client.CoreV1().Events(namespace).Watch(ctx, listOptions)
 	if err != nil {
 		return err
@@ -307,7 +322,7 @@ func (o *EventsOptions) runWatch(ctx context.Context, namespace string, listOpti
 				return false, nil
 			}
 
-			if ev, ok := e.Object.(*corev1.Event); !ok || !o.filteredEventType(ev.Type) {
+			if ev, ok := e.Object.(*corev1.Event); !ok || !o.filteredEvent(*ev, cutoff) {
 				return false, nil
 			}
 
@@ -326,6 +341,19 @@ func (o *EventsOptions) runWatch(ctx context.Context, namespace string, listOpti
 	})
 
 	return nil
+}
+
+// filteredEvent checks whether an event should be printed based on
+// the event type and the --since cutoff.
+func (o *EventsOptions) filteredEvent(event corev1.Event, cutoff time.Time) bool {
+	if !o.filteredEventType(event.Type) {
+		return false
+	}
+	if cutoff.IsZero() {
+		return true
+	}
+	t := eventTime(event)
+	return t.IsZero() || !t.Before(cutoff)
 }
 
 // filteredEventType checks given event can be printed
